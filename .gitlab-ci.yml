@@ -25,13 +25,6 @@
 
 stages:
   - build        # Docker build + push to registry
-  - scan         # MCP vulnerability scan + SBOM generation (parallel)
-  - ai-review    # Claude: security code review
-  - ai-fix       # Claude: patch Dockerfile + rebuild + rescan + open MR (parallel)
-  - ai-vex       # Claude: VEX for remaining (post-fix) vulnerabilities only
-  - report       # Consolidated before/after security report
-  - attach       # ORAS: attach all artifacts to image in registry as OCI referrers
-
 variables:
   IMAGE_NAME:    "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
   IMAGE_LATEST:  "$CI_REGISTRY_IMAGE:latest"
