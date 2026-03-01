@@ -22,7 +22,9 @@
 # Local GitLab:  http://localhost:8929
 # Registry:      http://localhost:5050
 # ══════════════════════════════════════════════════════════════════════════════
-
+include:
+  - template: Security/Container-Scanning.gitlab-ci.yml
+  
 stages:
   - build        # Docker build + push to registry
 variables:
