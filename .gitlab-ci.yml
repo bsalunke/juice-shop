@@ -872,12 +872,5 @@ build-image:
 #       oras discover --insecure "${IMAGE_REF}" 2>/dev/null || \
 #         echo "(oras discover not supported on this registry version)"
 #   dependencies:
-    - build-image
-    # - scan-vulnerabilities
-    # - get-sbom
-    # - ai-code-review
-    # - ai-vuln-fix
-    # - rebuild-rescan-mr
-    # - ai-vex-generation
-    # - security-report
+#    - build-image
   when: on_success   # only attach if all prior stages passed
