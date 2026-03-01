@@ -1,7 +1,883 @@
-include:
-  - template: Auto-DevOps.gitlab-ci.yml
+# ══════════════════════════════════════════════════════════════════════════════
+# DevSecOps Pipeline: Build → Scan+SBOM → AI Review → AI Fix+Rescan+MR → VEX → Report → Attach
+# Uses Claude Code in non-interactive (--print) mode for all AI tasks.
+#
+# Required CI/CD Variables (Settings → CI/CD → Variables):
+#   ANTHROPIC_API_KEY        - Claude API key (Masked)
+#   GITLAB_BOT_TOKEN         - Project access token with api+write_repository scope
+#                              (used to push fix branch and open MR)
+#   MCP_API_KEY              - API key for your MCP binary, if needed (Masked)
+#   CI_REGISTRY_USER         - auto-set by GitLab
+#   CI_REGISTRY_PASSWORD     - auto-set by GitLab
+#
+# MCP Binary (stdio mode):
+#   Host path  : /opt/mcp-bins/mcp-vuln-scanner  ← place your binary here
+#   In container: /opt/mcp-bins/mcp-vuln-scanner  (mounted read-only via runner config)
+#   See scripts/deploy.sh for setup.
+#
+# Local GitLab registry access from inside Docker containers:
+#   Set REGISTRY_INTERNAL_HOST = gitlab:5050 in CI/CD variables for local setup.
+#   Leave empty / unset for GitLab.com (uses CI_REGISTRY automatically).
+#
+# Local GitLab:  http://localhost:8929
+# Registry:      http://localhost:5050
+# ══════════════════════════════════════════════════════════════════════════════
+
+stages:
+  - build        # Docker build + push to registry
+  - scan         # MCP vulnerability scan + SBOM generation (parallel)
+  - ai-review    # Claude: security code review
+  - ai-fix       # Claude: patch Dockerfile + rebuild + rescan + open MR (parallel)
+  - ai-vex       # Claude: VEX for remaining (post-fix) vulnerabilities only
+  - report       # Consolidated before/after security report
+  - attach       # ORAS: attach all artifacts to image in registry as OCI referrers
 
 variables:
-  SAST_EXCLUDED_PATHS: "frontend/src/assets/private/**"
-  TEST_DISABLED: "true"
-  DAST_DISABLED: "true"
+  IMAGE_NAME:    "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+  IMAGE_LATEST:  "$CI_REGISTRY_IMAGE:latest"
+  IMAGE_PATCHED: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA-patched"
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  CLAUDE_CODE_VERSION: "latest"
+  # For local GitLab: containers can't reach "localhost:5050" — they use the
+  # Docker service name instead. Set this variable in GitLab CI/CD settings:
+  #   REGISTRY_INTERNAL_HOST = gitlab:5050   (local setup)
+  #   leave unset / empty    = use $CI_REGISTRY (GitLab.com or remote)
+  REGISTRY_INTERNAL_HOST: ""
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Reusable anchor: installs Claude Code CLI
+# ──────────────────────────────────────────────────────────────────────────────
+.claude-setup: &claude-setup
+  image: node:20-alpine
+  before_script:
+    - apk add --no-cache jq curl git python3
+    - npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} --quiet
+    - claude --version
+  variables:
+    ANTHROPIC_API_KEY: "$ANTHROPIC_API_KEY"
+    CLAUDE_CODE_DISABLE_TELEMETRY: "1"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helper: resolve the registry host reachable from inside a container
+# ──────────────────────────────────────────────────────────────────────────────
+.registry-host: &registry-host |
+  EFFECTIVE_REGISTRY="${REGISTRY_INTERNAL_HOST:-$CI_REGISTRY}"
+  echo "Using registry: ${EFFECTIVE_REGISTRY}"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 1 — Build & push image to GitLab Container Registry
+# ══════════════════════════════════════════════════════════════════════════════
+build-image:
+  stage: build
+  image: docker:24-cli
+  services:
+    - name: docker:24-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_TLS_VERIFY: "1"
+    DOCKER_CERT_PATH: "/certs/client"
+  script:
+    - *registry-host
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$EFFECTIVE_REGISTRY"
+    - |
+      docker build \
+        --label "git.commit=$CI_COMMIT_SHA" \
+        --label "git.branch=$CI_COMMIT_REF_NAME" \
+        --label "pipeline.id=$CI_PIPELINE_ID" \
+        -t "$IMAGE_NAME" \
+        -t "$IMAGE_LATEST" \
+        .
+    - docker push "$IMAGE_NAME"
+    - docker push "$IMAGE_LATEST"
+    - echo "$IMAGE_NAME" > image-name.txt
+    - docker inspect "$IMAGE_NAME" --format '{{.Id}}' > image-digest.txt
+  artifacts:
+    paths:
+      - image-name.txt
+      - image-digest.txt
+    expire_in: 1 day
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# # STAGE 2a — Vulnerability Scan via MCP binary (stdio mode)
+# # ══════════════════════════════════════════════════════════════════════════════
+# scan-vulnerabilities:
+#   stage: scan
+#   <<: *claude-setup
+#   variables:
+#     MCP_BINARY_PATH: "/opt/mcp-bins/mcp-vuln-scanner"
+#   script:
+#     - IMAGE=$(cat image-name.txt)
+#     - |
+#       if [ ! -f "${MCP_BINARY_PATH}" ]; then
+#         echo "ERROR: MCP binary not found at ${MCP_BINARY_PATH}"
+#         exit 1
+#       fi
+#       chmod +x "${MCP_BINARY_PATH}"
+#     # ── Write MCP config (stdio) ───────────────────────────────────────────
+#     - *registry-host
+#     - |
+#       mkdir -p ~/.claude
+#       cat > ~/.claude/mcp-servers.json << EOF
+#       {
+#         "mcpServers": {
+#           "vuln-scanner": {
+#             "command": "${MCP_BINARY_PATH}",
+#             "args": [
+#               "--image",         "${IMAGE}",
+#               "--registry-url",  "${EFFECTIVE_REGISTRY}",
+#               "--output-format", "json",
+#               "--severity",      "CRITICAL,HIGH,MEDIUM,LOW"
+#             ],
+#             "env": {
+#               "REGISTRY_USER":     "${CI_REGISTRY_USER}",
+#               "REGISTRY_PASSWORD": "${CI_REGISTRY_PASSWORD}",
+#               "MCP_API_KEY":       "${MCP_API_KEY}"
+#             }
+#           }
+#         }
+#       }
+#       EOF
+#     # ── ✏ EDIT BELOW — adjust args/env to match your binary ──────────────
+#     - |
+#       claude --print \
+#         --output-format json \
+#         --allowedTools "mcp__vuln-scanner__*" \
+#         "Use the vulnerability scanner MCP tool to scan this container image: ${IMAGE}
+
+#         Return structured JSON with ALL findings:
+#         {
+#           \"image\": \"<image name>\",
+#           \"scan_timestamp\": \"<ISO8601 timestamp>\",
+#           \"summary\": { \"critical\": 0, \"high\": 0, \"medium\": 0, \"low\": 0 },
+#           \"vulnerabilities\": [
+#             {
+#               \"id\": \"CVE-XXXX-XXXXX\",
+#               \"severity\": \"CRITICAL|HIGH|MEDIUM|LOW\",
+#               \"package\": \"<pkg>\",
+#               \"installed_version\": \"<ver>\",
+#               \"fixed_version\": \"<ver or null>\",
+#               \"patchable\": true,
+#               \"description\": \"<desc>\",
+#               \"cvss_score\": 0.0
+#             }
+#           ]
+#         }
+#         Output ONLY valid JSON." \
+#         > scan-raw.json
+#     - |
+#       jq -r '
+#         if type == "array" then
+#           [.[] | select(.type == "assistant") | .content[] | select(.type == "text") | .text] | last
+#         elif .content then .content
+#         else . end
+#       ' scan-raw.json > scan-results.json 2>/dev/null || cp scan-raw.json scan-results.json
+#     - echo "=== Scan Summary ===" && jq '.summary' scan-results.json
+#   artifacts:
+#     paths:
+#       - scan-results.json
+#       - scan-raw.json
+#     expire_in: 7 days
+#   dependencies:
+#     - build-image
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# # STAGE 2b — SBOM Generation via MCP binary (runs in parallel with scan)
+# # ══════════════════════════════════════════════════════════════════════════════
+# get-sbom:
+#   stage: scan
+#   <<: *claude-setup
+#   variables:
+#     MCP_BINARY_PATH: "/opt/mcp-bins/mcp-vuln-scanner"
+#   script:
+#     - IMAGE=$(cat image-name.txt)
+#     - chmod +x "${MCP_BINARY_PATH}"
+#     - *registry-host
+#     - |
+#       mkdir -p ~/.claude
+#       cat > ~/.claude/mcp-servers.json << EOF
+#       {
+#         "mcpServers": {
+#           "vuln-scanner": {
+#             "command": "${MCP_BINARY_PATH}",
+#             "args": ["--registry-url", "${EFFECTIVE_REGISTRY}", "--output-format", "json"],
+#             "env": {
+#               "REGISTRY_USER":     "${CI_REGISTRY_USER}",
+#               "REGISTRY_PASSWORD": "${CI_REGISTRY_PASSWORD}",
+#               "MCP_API_KEY":       "${MCP_API_KEY}"
+#             }
+#           }
+#         }
+#       }
+#       EOF
+#     - |
+#       claude --print \
+#         --output-format json \
+#         --allowedTools "mcp__vuln-scanner__*" \
+#         "Use the MCP tool to generate a CycloneDX SBOM for this container image: ${IMAGE}
+
+#         Return a complete, valid CycloneDX 1.5 JSON document.
+#         Include: bomFormat, specVersion, serialNumber, version, metadata,
+#         components (all packages found in the image with name, version, purl, licenses).
+#         Output ONLY valid JSON." \
+#         > sbom-raw.json
+#     - |
+#       jq -r '
+#         if type == "array" then
+#           [.[] | select(.type == "assistant") | .content[] | select(.type == "text") | .text] | last
+#         elif .content then .content
+#         else . end
+#       ' sbom-raw.json > sbom.json 2>/dev/null || cp sbom-raw.json sbom.json
+#     - python3 -c "import json; d=json.load(open('sbom.json')); print('SBOM components:', len(d.get('components',[])))"
+#   artifacts:
+#     paths:
+#       - sbom.json
+#       - sbom-raw.json
+#     expire_in: 90 days
+#   dependencies:
+#     - build-image
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# # STAGE 3 — AI Code Review (Dockerfile + source + scan results)
+# # ══════════════════════════════════════════════════════════════════════════════
+# ai-code-review:
+#   stage: ai-review
+#   <<: *claude-setup
+#   script:
+#     - IMAGE=$(cat image-name.txt)
+#     - SCAN_RESULTS=$(cat scan-results.json)
+#     - |
+#       DOCKERFILE=$(cat Dockerfile 2>/dev/null || echo "# No Dockerfile found")
+#       SRC_FILES=$(find . \( -name "*.py" -o -name "*.go" -o -name "*.js" -o -name "*.ts" \) \
+#         -not -path "*/node_modules/*" -not -path "*/.git/*" | head -20 \
+#         | xargs cat 2>/dev/null || echo "")
+#     - |
+#       claude --print \
+#         --output-format text \
+#         "You are a senior DevSecOps engineer performing a security review.
+
+#         ## Image Under Review
+#         ${IMAGE}
+
+#         ## Dockerfile
+#         \`\`\`dockerfile
+#         ${DOCKERFILE}
+#         \`\`\`
+
+#         ## Source Code (sampled)
+#         \`\`\`
+#         ${SRC_FILES}
+#         \`\`\`
+
+#         ## Vulnerability Scan Results
+#         \`\`\`json
+#         ${SCAN_RESULTS}
+#         \`\`\`
+
+#         Produce a structured Markdown security review:
+
+#         ### 1. Critical Issues (block deployment)
+#         ### 2. High Severity Findings
+#         ### 3. Medium / Low Findings
+#         ### 4. Dockerfile Best Practice Violations
+#         ### 5. Supply Chain Risks
+#         ### 6. Overall Risk Score (1-10) and Recommendation
+
+#         Be specific — reference exact CVE IDs, line numbers, and package names." \
+#         > code-review-report.md
+#     - echo "=== Code Review Complete ===" && wc -l code-review-report.md
+#   artifacts:
+#     name: "code-review-$CI_COMMIT_SHORT_SHA"
+#     paths:
+#       - code-review-report.md
+#     expire_in: 30 days
+#   dependencies:
+#     - build-image
+#     - scan-vulnerabilities
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# # STAGE 4a — AI Vulnerability Fix
+# # Generates: Dockerfile.patched, fix-changes.md, unfixable-vulns.md
+# # ══════════════════════════════════════════════════════════════════════════════
+# ai-vuln-fix:
+#   stage: ai-fix
+#   <<: *claude-setup
+#   script:
+#     - SCAN_RESULTS=$(cat scan-results.json)
+#     - DOCKERFILE=$(cat Dockerfile 2>/dev/null || echo "# No Dockerfile")
+#     - |
+#       claude --print \
+#         --output-format text \
+#         "You are a container hardening expert. Fix patchable vulnerabilities in this Dockerfile.
+
+#         ## Current Dockerfile
+#         \`\`\`dockerfile
+#         ${DOCKERFILE}
+#         \`\`\`
+
+#         ## Vulnerability Scan Results
+#         \`\`\`json
+#         ${SCAN_RESULTS}
+#         \`\`\`
+
+#         Rules:
+#         - Fix ALL CRITICAL and HIGH vulnerabilities where patchable=true
+#         - Update base image if it has known vulnerabilities
+#         - Pin all package versions to fixed versions
+#         - Add security hardening: non-root USER, minimal packages, no secrets in ENV
+#         - Preserve all existing functionality
+#         - Do NOT fix what cannot be safely automated
+
+#         Respond EXACTLY in this format:
+
+#         ===DOCKERFILE_START===
+#         <complete patched Dockerfile>
+#         ===DOCKERFILE_END===
+
+#         ===CHANGES_START===
+#         <markdown bullet list: change made and CVE IDs addressed>
+#         ===CHANGES_END===
+
+#         ===UNFIXABLE_START===
+#         <markdown list of CVEs that cannot be auto-patched and why>
+#         ===UNFIXABLE_END===" \
+#         > fix-raw.txt
+#     - |
+#       python3 - << 'PYEOF'
+#       import re
+#       content = open("fix-raw.txt").read()
+#       def extract(tag, text):
+#           m = re.search(rf'==={tag}_START===\n([\s\S]*?)\n==={tag}_END===', text)
+#           return m.group(1).strip() if m else ""
+#       df       = extract("DOCKERFILE", content)
+#       changes  = extract("CHANGES",    content)
+#       unfixable = extract("UNFIXABLE", content)
+#       if df:
+#           open("Dockerfile.patched", "w").write(df)
+#           print("Patched Dockerfile written.")
+#       else:
+#           print("WARNING: No patched Dockerfile found.")
+#       open("fix-changes.md",    "w").write(changes   or "No changes documented.")
+#       open("unfixable-vulns.md","w").write(unfixable  or "None.")
+#       PYEOF
+#     - echo "=== Changes ===" && cat fix-changes.md
+#     - echo "=== Unfixable ===" && cat unfixable-vulns.md
+#     - |
+#       if [ -f Dockerfile.patched ]; then
+#         echo "=== Diff (original vs patched) ==="
+#         diff Dockerfile Dockerfile.patched || true
+#       fi
+#   artifacts:
+#     name: "vuln-fix-$CI_COMMIT_SHORT_SHA"
+#     paths:
+#       - Dockerfile.patched
+#       - fix-changes.md
+#       - unfixable-vulns.md
+#       - fix-raw.txt
+#     expire_in: 30 days
+#   allow_failure: true
+#   dependencies:
+#     - scan-vulnerabilities
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# # STAGE 4b — Rebuild patched image, rescan, before/after comparison, open MR
+# # Runs in parallel with ai-vuln-fix? No — depends on it. Sequential in same stage.
+# # ══════════════════════════════════════════════════════════════════════════════
+# rebuild-rescan-mr:
+#   stage: ai-fix
+#   image: docker:24-cli
+#   services:
+#     - name: docker:24-dind
+#       alias: docker
+#   variables:
+#     DOCKER_HOST: tcp://docker:2376
+#     DOCKER_TLS_CERTDIR: "/certs"
+#     DOCKER_TLS_VERIFY: "1"
+#     DOCKER_CERT_PATH: "/certs/client"
+#     MCP_BINARY_PATH: "/opt/mcp-bins/mcp-vuln-scanner"
+#     ANTHROPIC_API_KEY: "$ANTHROPIC_API_KEY"
+#     CLAUDE_CODE_DISABLE_TELEMETRY: "1"
+#   before_script:
+#     # Install Node + Claude Code into docker:24-cli (Alpine-based)
+#     - apk add --no-cache nodejs npm jq curl git python3
+#     - npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} --quiet
+#     - claude --version
+#   script:
+#     - IMAGE=$(cat image-name.txt)
+#     - *registry-host
+#     # ── Step 1: Rebuild patched image ───────────────────────────────────────
+#     - |
+#       if [ ! -f Dockerfile.patched ]; then
+#         echo "No Dockerfile.patched — skipping rebuild, rescan and MR."
+#         echo '{"image":"'${IMAGE}'","summary":{"critical":0,"high":0,"medium":0,"low":0},"vulnerabilities":[]}' \
+#           > scan-results-after.json
+#         echo "_No patched image built — original Dockerfile had no auto-fixable vulnerabilities._" \
+#           > vuln-comparison.md
+#         exit 0
+#       fi
+#     - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$EFFECTIVE_REGISTRY"
+#     - |
+#       docker build \
+#         --label "git.commit=$CI_COMMIT_SHA" \
+#         --label "pipeline.id=$CI_PIPELINE_ID" \
+#         --label "patched=true" \
+#         -f Dockerfile.patched \
+#         -t "$IMAGE_PATCHED" \
+#         .
+#     - docker push "$IMAGE_PATCHED"
+#     - echo "Patched image pushed: $IMAGE_PATCHED"
+#     # ── Step 2: Re-scan patched image ───────────────────────────────────────
+#     - chmod +x "${MCP_BINARY_PATH}"
+#     - |
+#       mkdir -p ~/.claude
+#       cat > ~/.claude/mcp-servers.json << EOF
+#       {
+#         "mcpServers": {
+#           "vuln-scanner": {
+#             "command": "${MCP_BINARY_PATH}",
+#             "args": [
+#               "--image",         "${IMAGE_PATCHED}",
+#               "--registry-url",  "${EFFECTIVE_REGISTRY}",
+#               "--output-format", "json",
+#               "--severity",      "CRITICAL,HIGH,MEDIUM,LOW"
+#             ],
+#             "env": {
+#               "REGISTRY_USER":     "${CI_REGISTRY_USER}",
+#               "REGISTRY_PASSWORD": "${CI_REGISTRY_PASSWORD}",
+#               "MCP_API_KEY":       "${MCP_API_KEY}"
+#             }
+#           }
+#         }
+#       }
+#       EOF
+#     - |
+#       claude --print \
+#         --output-format json \
+#         --allowedTools "mcp__vuln-scanner__*" \
+#         "Scan the patched container image: ${IMAGE_PATCHED}
+
+#         Return structured JSON (same schema as before):
+#         { \"image\": \"\", \"scan_timestamp\": \"\", \"summary\": {...}, \"vulnerabilities\": [...] }
+#         Output ONLY valid JSON." \
+#         > rescan-raw.json
+#     - |
+#       jq -r '
+#         if type == "array" then
+#           [.[] | select(.type == "assistant") | .content[] | select(.type == "text") | .text] | last
+#         elif .content then .content
+#         else . end
+#       ' rescan-raw.json > scan-results-after.json 2>/dev/null || cp rescan-raw.json scan-results-after.json
+#     - echo "=== Post-fix Scan Summary ===" && jq '.summary' scan-results-after.json
+#     # ── Step 3: Before/after comparison ─────────────────────────────────────
+#     - SCAN_BEFORE=$(cat scan-results.json)
+#     - SCAN_AFTER=$(cat scan-results-after.json)
+#     - CHANGES=$(cat fix-changes.md 2>/dev/null || echo "")
+#     - |
+#       claude --print \
+#         --output-format text \
+#         "Compare these two vulnerability scan results and produce a Markdown report.
+
+#         ## Before (original image)
+#         \`\`\`json
+#         ${SCAN_BEFORE}
+#         \`\`\`
+
+#         ## After (patched image)
+#         \`\`\`json
+#         ${SCAN_AFTER}
+#         \`\`\`
+
+#         ## Changes Applied
+#         ${CHANGES}
+
+#         Produce a Markdown comparison report with:
+#         ### Summary Table
+#         | Severity | Before | After | Reduced by |
+#         |---|---|---|---|
+#         | Critical | X | Y | Z |
+#         ...
+
+#         ### CVEs Resolved
+#         List each CVE that is no longer present after patching.
+
+#         ### CVEs Remaining
+#         List each CVE still present with severity and whether it is exploitable.
+
+#         ### Risk Reduction Score
+#         Overall risk reduction as a percentage." \
+#         > vuln-comparison.md
+#     - echo "=== Comparison Report ===" && cat vuln-comparison.md
+#     # ── Step 4: Create MR with patched Dockerfile ───────────────────────────
+#     - |
+#       if [ -z "${GITLAB_BOT_TOKEN}" ]; then
+#         echo "GITLAB_BOT_TOKEN not set — skipping MR creation."
+#         echo "MR_URL=none" >> vuln-comparison.md
+#       else
+#         FIX_BRANCH="fix/vuln-auto-patch-${CI_COMMIT_SHORT_SHA}"
+
+#         # Configure git
+#         git config --global user.email "ci-bot@gitlab.local"
+#         git config --global user.name  "GitLab Security Bot"
+#         git remote set-url origin \
+#           "http://gitlab-ci-token:${GITLAB_BOT_TOKEN}@${CI_SERVER_HOST}:${CI_SERVER_PORT:-80}/${CI_PROJECT_PATH}.git"
+
+#         # Create fix branch from current commit
+#         git fetch origin
+#         git checkout -b "${FIX_BRANCH}"
+#         cp Dockerfile.patched Dockerfile
+#         git add Dockerfile
+
+#         CHANGES_SUMMARY=$(head -20 fix-changes.md 2>/dev/null || echo "Auto-patched vulnerabilities")
+#         git commit -m "fix: auto-patch container vulnerabilities [pipeline ${CI_PIPELINE_ID}]
+
+# ${CHANGES_SUMMARY}"
+
+#         git push origin "${FIX_BRANCH}"
+
+#         # Create MR via API
+#         MR_RESP=$(curl -sf --request POST \
+#           --header "PRIVATE-TOKEN: ${GITLAB_BOT_TOKEN}" \
+#           --header "Content-Type: application/json" \
+#           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests" \
+#           --data "{
+#             \"source_branch\":       \"${FIX_BRANCH}\",
+#             \"target_branch\":       \"${CI_DEFAULT_BRANCH:-main}\",
+#             \"title\":               \"fix: auto-patch container vulnerabilities (${CI_COMMIT_SHORT_SHA})\",
+#             \"description\":         \"## Automated Security Patch\n\nGenerated by pipeline [#${CI_PIPELINE_ID}](${CI_PIPELINE_URL})\n\n### Changes\n$(cat fix-changes.md 2>/dev/null)\n\n### Before/After\nSee pipeline artifacts: \`vuln-comparison.md\`\n\n### Remaining vulnerabilities\n$(cat unfixable-vulns.md 2>/dev/null)\",
+#             \"labels\":              \"security,automated-fix\",
+#             \"remove_source_branch\": true,
+#             \"squash\":               false
+#           }")
+
+#         MR_URL=$(echo "$MR_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('web_url',''))" 2>/dev/null || echo "")
+#         echo "MR created: ${MR_URL}"
+#         echo "" >> vuln-comparison.md
+#         echo "**MR:** ${MR_URL}" >> vuln-comparison.md
+#       fi
+#   artifacts:
+#     name: "rescan-mr-$CI_COMMIT_SHORT_SHA"
+#     paths:
+#       - scan-results-after.json
+#       - rescan-raw.json
+#       - vuln-comparison.md
+#     expire_in: 30 days
+#   allow_failure: true
+#   dependencies:
+#     - build-image
+#     - scan-vulnerabilities
+#     - ai-vuln-fix
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# # STAGE 5 — AI VEX Generation
+# # Based on REMAINING vulnerabilities only (post-fix scan + unfixable list)
+# # ══════════════════════════════════════════════════════════════════════════════
+# ai-vex-generation:
+#   stage: ai-vex
+#   <<: *claude-setup
+#   script:
+#     - IMAGE=$(cat image-name.txt)
+#     - DIGEST=$(cat image-digest.txt)
+#     - TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+#     # Use post-fix scan results if available, fall back to original
+#     - |
+#       if [ -f scan-results-after.json ]; then
+#         REMAINING_VULNS=$(cat scan-results-after.json)
+#         echo "Using post-fix scan results for VEX."
+#       else
+#         REMAINING_VULNS=$(cat scan-results.json)
+#         echo "Using original scan results for VEX (no patched image available)."
+#       fi
+#     - UNFIXABLE=$(cat unfixable-vulns.md 2>/dev/null || echo "None.")
+#     - |
+#       claude --print \
+#         --output-format text \
+#         "Generate a VEX (Vulnerability Exploitability eXchange) document in OpenVEX format.
+
+#         This VEX covers ONLY the vulnerabilities REMAINING after automated patching.
+#         Vulnerabilities that were fixed are NOT included — they are already resolved.
+
+#         ## Image Metadata
+#         - Name:      ${IMAGE}
+#         - Digest:    ${DIGEST}
+#         - Pipeline:  ${CI_PIPELINE_URL}
+#         - Commit:    ${CI_COMMIT_SHA}
+#         - Generated: ${TIMESTAMP}
+
+#         ## Remaining Vulnerabilities (post-fix scan)
+#         \`\`\`json
+#         ${REMAINING_VULNS}
+#         \`\`\`
+
+#         ## Confirmed Unfixable Vulnerabilities
+#         ${UNFIXABLE}
+
+#         For each remaining CVE assign one of:
+#         - **not_affected**: vulnerable component exists but the code path is not reachable
+#         - **affected**: confirmed exploitable in this image/workload
+#         - **under_investigation**: exploitability unclear, needs further analysis
+
+#         Output ONLY valid JSON matching this OpenVEX schema:
+#         {
+#           \"@context\": \"https://openvex.dev/ns/v0.2.0\",
+#           \"@id\": \"https://pipeline.example.com/vex/${CI_PIPELINE_ID}\",
+#           \"author\": \"Automated DevSecOps Pipeline - Claude Code\",
+#           \"role\": \"Security Automation\",
+#           \"timestamp\": \"${TIMESTAMP}\",
+#           \"version\": 1,
+#           \"tooling\": \"Claude Code (claude-sonnet-4-6) + MCP Vulnerability Scanner\",
+#           \"statements\": [
+#             {
+#               \"vulnerability\": {\"name\": \"CVE-XXXX-XXXXX\"},
+#               \"products\": [{\"@id\": \"pkg:oci/${IMAGE}?digest=${DIGEST}\"}],
+#               \"status\": \"<status>\",
+#               \"status_notes\": \"<justification>\",
+#               \"action_statement\": \"<mitigation if affected, else omit>\"
+#             }
+#           ]
+#         }
+#         Output ONLY the JSON. No markdown fences." \
+#         > vex-raw.txt
+#     - |
+#       if python3 -c "import json; json.load(open('vex-raw.txt'))" 2>/dev/null; then
+#         cp vex-raw.txt vex-document.json
+#         echo "VEX document is valid JSON."
+#       else
+#         sed '/^```/d' vex-raw.txt > vex-document.json
+#         python3 -c "import json; json.load(open('vex-document.json'))" \
+#           && echo "VEX parsed after fence removal." \
+#           || echo "WARNING: VEX may not be valid JSON."
+#       fi
+#     - |
+#       python3 -c "
+#       import json
+#       d = json.load(open('vex-document.json'))
+#       stmts = d.get('statements', [])
+#       by_status = {}
+#       for s in stmts:
+#           st = s.get('status','unknown')
+#           by_status[st] = by_status.get(st, 0) + 1
+#       print(f'VEX statements: {len(stmts)}')
+#       for k,v in by_status.items():
+#           print(f'  {k}: {v}')
+#       "
+#   artifacts:
+#     name: "vex-$CI_COMMIT_SHORT_SHA"
+#     paths:
+#       - vex-document.json
+#       - vex-raw.txt
+#     expire_in: 90 days
+#   dependencies:
+#     - build-image
+#     - scan-vulnerabilities
+#     - ai-vuln-fix
+#     - rebuild-rescan-mr
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# # STAGE 6 — Consolidated Security Report (before AND after)
+# # ══════════════════════════════════════════════════════════════════════════════
+# security-report:
+#   stage: report
+#   image: alpine:latest
+#   before_script:
+#     - apk add --no-cache jq python3
+#   script:
+#     - IMAGE=$(cat image-name.txt)
+#     - CRITICAL_BEFORE=$(jq '.summary.critical // 0' scan-results.json 2>/dev/null || echo 0)
+#     - HIGH_BEFORE=$(jq '.summary.high     // 0' scan-results.json 2>/dev/null || echo 0)
+#     - |
+#       if [ -f scan-results-after.json ]; then
+#         CRITICAL_AFTER=$(jq '.summary.critical // 0' scan-results-after.json 2>/dev/null || echo "N/A")
+#         HIGH_AFTER=$(jq    '.summary.high     // 0' scan-results-after.json 2>/dev/null || echo "N/A")
+#       else
+#         CRITICAL_AFTER="N/A (no patched image)"
+#         HIGH_AFTER="N/A"
+#       fi
+#     - VEX_COUNT=$(jq '.statements | length' vex-document.json 2>/dev/null || echo 0)
+#     - MR_LINE=$(grep "^\*\*MR:\*\*" vuln-comparison.md 2>/dev/null | head -1 || echo "_No MR created_")
+#     - |
+#       cat > security-report.md << REPORT
+#       # Security Pipeline Report
+
+#       | Field | Value |
+#       |---|---|
+#       | **Image** | ${IMAGE} |
+#       | **Patched Image** | ${IMAGE_PATCHED} |
+#       | **Pipeline** | ${CI_PIPELINE_URL} |
+#       | **Branch** | ${CI_COMMIT_REF_NAME} |
+#       | **Commit** | ${CI_COMMIT_SHA} |
+#       | **Date** | $(date -u) |
+
+#       ## Vulnerability Summary — Before vs After Fix
+
+#       | Severity | Before | After | Status |
+#       |---|---|---|---|
+#       | Critical | ${CRITICAL_BEFORE} | ${CRITICAL_AFTER} | $([ "$CRITICAL_AFTER" -lt "$CRITICAL_BEFORE" ] 2>/dev/null && echo "✓ Reduced" || echo "→") |
+#       | High     | ${HIGH_BEFORE}     | ${HIGH_AFTER}     | $([ "$HIGH_AFTER" -lt "$HIGH_BEFORE" ] 2>/dev/null && echo "✓ Reduced" || echo "→") |
+
+#       ## Automated Fix MR
+#       ${MR_LINE}
+
+#       ## Changes Applied by Claude
+
+#       $(cat fix-changes.md 2>/dev/null || echo "_No automated fixes applied._")
+
+#       ## Remaining Unfixed Vulnerabilities
+
+#       $(cat unfixable-vulns.md 2>/dev/null || echo "_None._")
+
+#       ## Before vs After Comparison
+
+#       $(cat vuln-comparison.md 2>/dev/null || echo "_Comparison not available._")
+
+#       ## VEX Document
+
+#       - Statements: ${VEX_COUNT} (covering remaining vulnerabilities only)
+#       - Artifact: \`vex-document.json\`
+
+#       ## Pipeline Artifacts
+#       | Artifact | Description |
+#       |---|---|
+#       | \`scan-results.json\` | Original vulnerability scan |
+#       | \`scan-results-after.json\` | Post-fix vulnerability scan |
+#       | \`sbom.json\` | CycloneDX SBOM of original image |
+#       | \`vuln-comparison.md\` | Before/after comparison report |
+#       | \`code-review-report.md\` | Full AI security review |
+#       | \`Dockerfile.patched\` | Auto-hardened Dockerfile |
+#       | \`vex-document.json\` | OpenVEX for remaining vulnerabilities |
+#       | \`security-report.md\` | This report |
+
+#       All artifacts attached to registry image as OCI referrers (see attach stage).
+#       REPORT
+#     - cat security-report.md
+#     # Fail if criticals remain unaddressed after fix
+#     - |
+#       if [ "${CRITICAL_AFTER}" != "N/A (no patched image)" ] && \
+#          [ "${CRITICAL_AFTER}" != "N/A" ] && \
+#          [ "${CRITICAL_AFTER}" -gt 0 ]; then
+#         echo "PIPELINE FAILED: ${CRITICAL_AFTER} critical vulnerabilities remain after patching."
+#         exit 1
+#       fi
+#   artifacts:
+#     name: "security-report-$CI_COMMIT_SHORT_SHA"
+#     paths:
+#       - security-report.md
+#     expire_in: 90 days
+#   dependencies:
+#     - build-image
+#     - scan-vulnerabilities
+#     - ai-code-review
+#     - ai-vuln-fix
+#     - rebuild-rescan-mr
+#     - ai-vex-generation
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# # STAGE 7 — Attach all artifacts to image in registry as OCI referrers
+# # Uses ORAS CLI (https://oras.land) — OCI 1.1 artifact referrer spec
+# # Only runs if all previous stages succeeded (no allow_failure propagation)
+# # ══════════════════════════════════════════════════════════════════════════════
+# attach-oci-artifacts:
+#   stage: attach
+#   image: alpine:latest
+#   variables:
+#     ORAS_VERSION: "1.2.0"
+#   before_script:
+#     - apk add --no-cache curl jq
+#     # Install ORAS CLI
+#     - |
+#       ARCH=$(uname -m)
+#       case "$ARCH" in
+#         x86_64)  ORAS_ARCH="amd64" ;;
+#         aarch64) ORAS_ARCH="arm64" ;;
+#         *)        ORAS_ARCH="amd64" ;;
+#       esac
+#       curl -fsSL \
+#         "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_${ORAS_ARCH}.tar.gz" \
+#         | tar -xzf - oras
+#       mv oras /usr/local/bin/oras
+#       oras version
+#   script:
+#     - IMAGE=$(cat image-name.txt)
+#     - *registry-host
+#     # ── Login to registry ──────────────────────────────────────────────────
+#     - |
+#       oras login "${EFFECTIVE_REGISTRY}" \
+#         -u "${CI_REGISTRY_USER}" \
+#         -p "${CI_REGISTRY_PASSWORD}" \
+#         --insecure 2>/dev/null || \
+#       oras login "${EFFECTIVE_REGISTRY}" \
+#         -u "${CI_REGISTRY_USER}" \
+#         -p "${CI_REGISTRY_PASSWORD}"
+#     # Build the fully-qualified image reference ORAS needs
+#     - |
+#       # Replace CI_REGISTRY host with the effective (internally reachable) host
+#       IMAGE_REF=$(echo "${IMAGE}" | sed "s|${CI_REGISTRY}|${EFFECTIVE_REGISTRY}|")
+#       echo "Attaching artifacts to: ${IMAGE_REF}"
+#     # ── Attach SBOM ────────────────────────────────────────────────────────
+#     - |
+#       if [ -f sbom.json ]; then
+#         oras attach \
+#           --artifact-type "application/vnd.cyclonedx+json" \
+#           --insecure \
+#           "${IMAGE_REF}" \
+#           "sbom.json:application/vnd.cyclonedx+json"
+#         echo "✓ SBOM attached"
+#       else
+#         echo "! sbom.json not found — skipping"
+#       fi
+#     # ── Attach VEX ─────────────────────────────────────────────────────────
+#     - |
+#       if [ -f vex-document.json ]; then
+#         oras attach \
+#           --artifact-type "application/vnd.openvex+json" \
+#           --insecure \
+#           "${IMAGE_REF}" \
+#           "vex-document.json:application/vnd.openvex+json"
+#         echo "✓ VEX attached"
+#       else
+#         echo "! vex-document.json not found — skipping"
+#       fi
+#     # ── Attach scan results (before + after) ───────────────────────────────
+#     - |
+#       SCAN_FILES=""
+#       [ -f scan-results.json ]       && SCAN_FILES="$SCAN_FILES scan-results.json:application/vnd.security.scan.results+json"
+#       [ -f scan-results-after.json ] && SCAN_FILES="$SCAN_FILES scan-results-after.json:application/vnd.security.scan.results+json"
+#       if [ -n "$SCAN_FILES" ]; then
+#         oras attach \
+#           --artifact-type "application/vnd.security.scan.results" \
+#           --insecure \
+#           "${IMAGE_REF}" \
+#           $SCAN_FILES
+#         echo "✓ Scan results attached"
+#       fi
+#     # ── Attach security reports ────────────────────────────────────────────
+#     - |
+#       REPORT_FILES=""
+#       [ -f security-report.md ]   && REPORT_FILES="$REPORT_FILES security-report.md:text/markdown"
+#       [ -f code-review-report.md ] && REPORT_FILES="$REPORT_FILES code-review-report.md:text/markdown"
+#       [ -f vuln-comparison.md ]   && REPORT_FILES="$REPORT_FILES vuln-comparison.md:text/markdown"
+#       if [ -n "$REPORT_FILES" ]; then
+#         oras attach \
+#           --artifact-type "application/vnd.security.report" \
+#           --insecure \
+#           "${IMAGE_REF}" \
+#           $REPORT_FILES
+#         echo "✓ Security reports attached"
+#       fi
+#     # ── List referrers attached to this image ──────────────────────────────
+#     - |
+#       echo ""
+#       echo "=== OCI Referrers attached to ${IMAGE_REF} ==="
+#       oras discover --insecure "${IMAGE_REF}" 2>/dev/null || \
+#         echo "(oras discover not supported on this registry version)"
+#   dependencies:
+    - build-image
+    # - scan-vulnerabilities
+    # - get-sbom
+    # - ai-code-review
+    # - ai-vuln-fix
+    # - rebuild-rescan-mr
+    # - ai-vex-generation
+    # - security-report
+  when: on_success   # only attach if all prior stages passed
